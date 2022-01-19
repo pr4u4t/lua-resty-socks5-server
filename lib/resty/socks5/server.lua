@@ -1,4 +1,4 @@
-local _M = { _VERSION = '0.1.2' }
+local _VERSION = '0.1.3'
 
 local bit = require "bit"
 local byte = string.byte
@@ -42,21 +42,20 @@ local support_methods = {
     [AUTH] = true
 }
 
-local function send_method(sock, method)
-    --
-    --+----+--------+
-    --|VER | METHOD |
-    --+----+--------+
-    --| 1  |   1    |
-    --+----+--------+
-    --
 
+--[[
+    ----+--------+
+    |VER | METHOD |
+    +----+--------+
+    | 1  |   1    |
+    +----+--------+
+]]
+local function _socks5_server_send_method(sock, method)
     local data = char(VERSION, method)
-
     return sock:send(data)
 end
 
-local function receive_methods(sock)
+local function _socks5_server_receive_methods(sock)
     --
     --   +----+----------+----------+
     --   |VER | NMETHODS | METHODS  |
@@ -89,7 +88,7 @@ local function receive_methods(sock)
     }, nil
 end
 
-local function send_replies(sock, rep, atyp, addr, port)
+local function _socks5_server_send_replies(sock, rep, atyp, addr, port)
     --
     --+----+-----+-------+------+----------+----------+
     --|VER | REP |  RSV  | ATYP | BND.ADDR | BND.PORT |
@@ -117,7 +116,7 @@ local function send_replies(sock, rep, atyp, addr, port)
     return sock:send(data)
 end
 
-local function receive_requests(sock)
+local function _socks5_server_receive_requests(sock)
     --
     -- +----+-----+-------+------+----------+----------+
     -- |VER | CMD |  RSV  | ATYP | DST.ADDR | DST.PORT |
@@ -145,7 +144,6 @@ local function receive_requests(sock)
         local data, err = sock:receive(1)
         if not data then
             ngx_log(ERR, "failed to receive domain name len: ", err)
-
             return nil, err
         end
         dst_len = byte(data, 1)
@@ -177,7 +175,7 @@ local function receive_requests(sock)
     }, nil
 end
 
-local function receive_auth(sock)
+local function _socks5_server_receive_auth(sock)
     --
     --+----+------+----------+------+----------+
     --|VER | ULEN |  UNAME   | PLEN |  PASSWD  |
@@ -221,7 +219,7 @@ local function receive_auth(sock)
     }, nil
 end
 
-local function send_auth_status(sock, status)
+local function _socks5_server_send_auth_status(sock, status)
     --
     --+----+--------+
     --|VER | STATUS |
@@ -238,7 +236,7 @@ local function send_auth_status(sock, status)
     return sock:send(data)
 end
 
-local function stringify_addr(atyp, addr)
+local function _stringify_addr(atyp, addr)
     if atyp == IPV4 then
         dst = string.format("%d.%d.%d.%d",
                 byte(data, 1),
@@ -262,8 +260,34 @@ local function stringify_addr(atyp, addr)
     end
 end
 
+local function _socks5_server_auth()
+    if username then
+        local auth, err = _receive_auth(downsock)
+        if err then
+            ngx_log(ERR, "send method error: ", err)
+            ngx_exit(ERROR)
+            return false
+        end
 
-function _M.run(timeout, username, password)
+        local status = FAILURE
+        if auth.username == username and auth.password == password then
+            status = SUCCEEDED
+        end
+
+        local ok, err = send_auth_status(downsock, status)
+        if err then
+            ngx_log(ERR, "send auth status error: ", err)
+            ngx_exit(ERROR)
+            return false
+        end
+
+        if status == FAILURE then
+            return false
+        end
+    end
+end
+
+local function _socks5_server_run(timeout)
     local downsock, err = assert(ngx.req.socket(true))
     if not downsock then
         ngx_log(ERR, "failed to get the request socket: ", err)
@@ -273,12 +297,11 @@ function _M.run(timeout, username, password)
     timeout = timeout or 1000
     downsock:settimeout(timeout)
 
-    local negotiation, err = receive_methods(downsock)
+    local negotiation, err = _receive_methods(downsock)
     if err then
         ngx_log(ERR, "receive methods error: ", err)
         ngx_exit(ERROR)
-
-        return
+        return false
     end
 
     if negotiation.ver ~= VERSION then
@@ -296,42 +319,16 @@ function _M.run(timeout, username, password)
         method = AUTH
     end
 
-    local ok, err = send_method(downsock, method)
+    local ok, err = _send_method(downsock, method)
     if err then
         ngx_log(ERR, "send method error: ", err)
         ngx_exit(ERROR)
-
         return
     end
 
-    if username then
-        local auth, err = receive_auth(downsock)
-        if err then
-            ngx_log(ERR, "send method error: ", err)
-            ngx_exit(ERROR)
+    -- SERVER AUTH
 
-            return
-        end
-
-        local status = FAILURE
-        if auth.username == username and auth.password == password then
-            status = SUCCEEDED
-        end
-
-        local ok, err = send_auth_status(downsock, status)
-        if err then
-            ngx_log(ERR, "send auth status error: ", err)
-            ngx_exit(ERROR)
-
-            return
-        end
-
-        if status == FAILURE then
-            return
-        end
-    end
-
-    local requests, err = receive_requests(downsock)
+    local requests, err = _receive_requests(downsock)
     if err then
         ngx_log(ERR, "send request error: ", err)
         ngx_exit(ERROR)
@@ -340,7 +337,7 @@ function _M.run(timeout, username, password)
     end
 
     if requests.cmd ~= CONNECT then
-        local ok, err = send_replies(downsock, COMMAND_NOT_SUPORTED)
+        local ok, err = _send_replies(downsock, COMMAND_NOT_SUPORTED)
         if err then
             ngx_log(ERR, "send replies error: ", err)
             ngx_exit(ERROR)
@@ -353,7 +350,7 @@ function _M.run(timeout, username, password)
     local upsock = ngx.socket.tcp()
     upsock:settimeout(timeout)
 
-    local addr = stringify_addr(requests.atyp, requests.addr)
+    local addr = _stringify_addr(requests.atyp, requests.addr)
     local ok, err = upsock:connect(addr, requests.port)
     if err then
         ngx_log(ERR, "connect request " .. requests.addr ..
@@ -402,4 +399,13 @@ function _M.run(timeout, username, password)
     ngx.thread.wait(co_downup)
 end
 
-return _M
+local _SERVER_MT = {
+	run    = _socks5_server_run,
+	auth   = _socks5_server_auth
+}
+
+local _MT = {
+    new = _new_socks5_server
+}
+
+return setmetatable({ _VERSION = _VERSION },{ __index = _MT })
