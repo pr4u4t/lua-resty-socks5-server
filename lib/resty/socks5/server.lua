@@ -6,12 +6,14 @@ local char = string.char
 local sub = string.sub
 local ngx_log = ngx.log
 local ngx_exit = ngx.exit
+local thread_spawn = ngx.thread.spawn
 
 local DEBUG = ngx.DEBUG
 local ERR = ngx.ERR
 local ERROR = ngx.ERROR
 local OK = ngx.OK
 
+local SOCKS_VERSION = 0x05
 local SUB_AUTH_VERSION = 0x01
 local RSV = 0x00
 local NOAUTH = 0x00
@@ -20,7 +22,6 @@ local AUTH = 0x02
 local IANA = 0x03
 local RESERVED = 0x80
 local NOMETHODS = 0xFF
-local VERSION = 0x05
 local IPV4 = 0x01
 local DOMAIN_NAME = 0x03
 local IPV6 = 0x04
@@ -37,10 +38,6 @@ local TTL_EXPIRED = 0x06
 local COMMAND_NOT_SUPORTED = 0x07
 local ADDRESS_TYPE_NOT_SUPPORTED = 0x08
 local UNASSIGNED = 0x09
-local support_methods = {
-    [NOAUTH]  = true,
-    [AUTH] = true
-}
 
 
 --[[
@@ -55,19 +52,17 @@ local function _socks5_server_send_method(sock, method)
     return sock:send(data)
 end
 
+--[[
+    +----+----------+----------+
+    |VER | NMETHODS | METHODS  |
+    +----+----------+----------+
+    | 1  |    1     | 1 to 255 |
+    +----+----------+----------+
+]]
 local function _socks5_server_receive_methods(sock)
-    --
-    --   +----+----------+----------+
-    --   |VER | NMETHODS | METHODS  |
-    --   +----+----------+----------+
-    --   | 1  |    1     | 1 to 255 |
-    --   +----+----------+----------+
-    --
-
     local data, err = sock:receive(2)
     if not data then
         ngx_exit(ERROR)
-
         return nil, err
     end
 
@@ -77,27 +72,25 @@ local function _socks5_server_receive_methods(sock)
     local methods, err = sock:receive(nmethods)
     if not methods then
         ngx_exit(ERROR)
-
         return nil, err
     end
 
     return {
-        ver= ver,
-        nmethods = nmethods,
-        methods = methods
-    }, nil
+        ver         = ver,
+        nmethods    = nmethods,
+        methods     = methods
+    }
 end
 
+--[[
+    +----+-----+-------+------+----------+----------+
+    |VER | REP |  RSV  | ATYP | BND.ADDR | BND.PORT |
+    +----+-----+-------+------+----------+----------+
+    | 1  |  1  | X'00' |  1   | Variable |    2     |
+    --+----+-----+-------+------+----------+----------+
+]]
 local function _socks5_server_send_replies(sock, rep, atyp, addr, port)
-    --
-    --+----+-----+-------+------+----------+----------+
-    --|VER | REP |  RSV  | ATYP | BND.ADDR | BND.PORT |
-    --+----+-----+-------+------+----------+----------+
-    --| 1  |  1  | X'00' |  1   | Variable |    2     |
-    --+----+-----+-------+------+----------+----------+
-    --
-
-    local data = {}
+    local data = { true, true, true }
     data[1] = char(VERSION)
     data[2] = char(rep)
     data[3] = char(RSV)
@@ -112,23 +105,20 @@ local function _socks5_server_send_replies(sock, rep, atyp, addr, port)
         data[6] = "\x00\x00"
     end
 
-
     return sock:send(data)
 end
 
+--[[
+    +----+-----+-------+------+----------+----------+
+    |VER | CMD |  RSV  | ATYP | DST.ADDR | DST.PORT |
+    +----+-----+-------+------+----------+----------+
+    | 1  |  1  | X'00' |  1   | Variable |    2     |
+    +----+-----+-------+------+----------+----------+
+]]
 local function _socks5_server_receive_requests(sock)
-    --
-    -- +----+-----+-------+------+----------+----------+
-    -- |VER | CMD |  RSV  | ATYP | DST.ADDR | DST.PORT |
-    -- +----+-----+-------+------+----------+----------+
-    -- | 1  |  1  | X'00' |  1   | Variable |    2     |
-    -- +----+-----+-------+------+----------+----------+
-    --
-
     local data, err = sock:receive(4)
     if not data then
         ngx_log(ERR, "failed to receive requests: ", err)
-
         return nil, err
     end
 
@@ -138,15 +128,15 @@ local function _socks5_server_receive_requests(sock)
     local atyp = byte(data, 4)
 
     local dst_len = 0
-    if atyp == IPV4 then
-        dst_len = 4
-    elseif atyp == DOMAIN_NAME then
+    if atyp == DOMAIN_NAME then
         local data, err = sock:receive(1)
         if not data then
             ngx_log(ERR, "failed to receive domain name len: ", err)
             return nil, err
         end
         dst_len = byte(data, 1)
+    elseif atyp == IPV4 then
+        dst_len = 4
     elseif atyp == IPV6 then
         dst_len = 16
     else
@@ -156,7 +146,6 @@ local function _socks5_server_receive_requests(sock)
     local data, err = sock:receive(dst_len + 2) -- port
     if err then
         ngx_log(ERR, "failed to receive DST.ADDR: ", err)
-
         return nil, err
     end
 
@@ -166,24 +155,23 @@ local function _socks5_server_receive_requests(sock)
     local port = port_1 + port_2 * 256
 
     return {
-        ver = ver,
-        cmd = cmd,
-        rsv = rsv,
-        atyp = atyp,
-        addr = dst,
-        port = port,
-    }, nil
+        ver     = ver,
+        cmd     = cmd,
+        rsv     = rsv,
+        atyp    = atyp,
+        addr    = dst,
+        port    = port,
+    }
 end
 
+--[[
+    +----+------+----------+------+----------+
+    |VER | ULEN |  UNAME   | PLEN |  PASSWD  |
+    +----+------+----------+------+----------+
+    | 1  |  1   | 1 to 255 |  1   | 1 to 255 |
+    +----+------+----------+------+----------+
+]]
 local function _socks5_server_receive_auth(sock)
-    --
-    --+----+------+----------+------+----------+
-    --|VER | ULEN |  UNAME   | PLEN |  PASSWD  |
-    --+----+------+----------+------+----------+
-    --| 1  |  1   | 1 to 255 |  1   | 1 to 255 |
-    --+----+------+----------+------+----------+
-    --
-
     local data, err = sock:receive(2)
     if err then
         return nil, err
@@ -216,19 +204,18 @@ local function _socks5_server_receive_auth(sock)
     return {
         username = uname,
         password = passwd
-    }, nil
+    }
 end
 
+--[[
+    +----+--------+
+    |VER | STATUS |
+    +----+--------+
+    | 1  |   1    |
+    +----+--------+
+]]
 local function _socks5_server_send_auth_status(sock, status)
-    --
-    --+----+--------+
-    --|VER | STATUS |
-    --+----+--------+
-    --| 1  |   1    |
-    --+----+--------+
-    --
-
-    local data = {}
+    local data = { true, true }
 
     data[1] = char(SUB_AUTH_VERSION)
     data[2] = char(status)
@@ -287,7 +274,45 @@ local function _socks5_server_auth()
     end
 end
 
-local function _socks5_server_run(timeout)
+local function _socks5_server_auth_method()
+
+    return true
+end
+
+local function _socks5_server_noauth_method()
+    return true
+end
+
+local _auth_methods = {
+    [NOAUTH]    = _socks5_server_noauth_method,
+    [AUTH]      = _socks5_server_auth_method
+}
+
+local function socks_pipe(src, dst)
+    while true do
+        local data, err, partial = src:receive('*b')
+        if not data then
+            if partial then
+                dst:send(partial)
+            end
+
+            if err ~= 'closed' then
+                ngx_log(ERR, "pipe receive the src get error: ", err)
+            end
+
+            break
+        end
+
+        local ok, err = dst:send(data)
+        if err then
+            ngx_log(ERR, "pipe send the dst get error: ", err)
+
+            return
+        end
+    end
+end
+
+local function _socks5_server_run(self)
     local downsock, err = assert(ngx.req.socket(true))
     if not downsock then
         ngx_log(ERR, "failed to get the request socket: ", err)
@@ -304,7 +329,7 @@ local function _socks5_server_run(timeout)
         return false
     end
 
-    if negotiation.ver ~= VERSION then
+    if negotiation.ver ~= SOCKS_VERSION then
         ngx_log(DEBUG, "only support version: ", VERSION)
         return ngx_exit(OK)
     end
@@ -332,7 +357,6 @@ local function _socks5_server_run(timeout)
     if err then
         ngx_log(ERR, "send request error: ", err)
         ngx_exit(ERROR)
-
         return
     end
 
@@ -343,7 +367,6 @@ local function _socks5_server_run(timeout)
             ngx_exit(ERROR)
 
         end
-
         return
     end
 
@@ -356,7 +379,6 @@ local function _socks5_server_run(timeout)
         ngx_log(ERR, "connect request " .. requests.addr ..
             ":" .. requests.port .. " error: ", err)
         ngx_exit(ERROR)
-
         return
     end
 
@@ -364,36 +386,11 @@ local function _socks5_server_run(timeout)
     if err then
         ngx_log(ERR, "send replies error: ", err)
         ngx_exit(ERROR)
-
         return
     end
 
-    local pipe = function(src, dst)
-        while true do
-            local data, err, partial = src:receive('*b')
-            if not data then
-                if partial then
-                    dst:send(partial)
-                end
-
-                if err ~= 'closed' then
-                    ngx_log(ERR, "pipe receive the src get error: ", err)
-                end
-
-                break
-            end
-
-            local ok, err = dst:send(data)
-            if err then
-                ngx_log(ERR, "pipe send the dst get error: ", err)
-
-                return
-            end
-        end
-    end
-
-    local co_updown = ngx.thread.spawn(pipe, upsock, downsock)
-    local co_downup = ngx.thread.spawn(pipe, downsock, upsock)
+    local co_updown = thread_spawn(socks_pipe, upsock, downsock)
+    local co_downup = thread_spawn(socks_pipe, downsock, upsock)
 
     ngx.thread.wait(co_updown)
     ngx.thread.wait(co_downup)
@@ -408,4 +405,14 @@ local _MT = {
     new = _new_socks5_server
 }
 
-return setmetatable({ _VERSION = _VERSION },{ __index = _MT })
+local function _new_socks5_server(auth_mth, auth_cb, timeout)
+    return setmetatable({
+        auth_method = auth_mth,
+        auth_cb     = auth_cb,
+        timeout     = timeout
+    },{ __index = _SERVER_MT})
+end
+
+return setmetatable({
+        _VERSION    = _VERSION,
+    },{ __index = _MT })
